@@ -1,6 +1,5 @@
 import readline from "readline";
 
-
 import { emulators } from "./config/emulators.js";
 import { sites } from "./config/sites.js";
 import { SYSTEM } from "./config/system.js";
@@ -17,10 +16,6 @@ import { waitForBoot, waitForAdbPresence } from "./services/adbWait.service.js";
 
 // ✅ IMPORTA adb “baixo nível” para poder limpar Chrome por instância
 import { adb } from "./services/adb.service.js";
-
-import { loadLocalEnv } from "./utils/loadLocalEnv.js";
-loadLocalEnv();
-
 
 // ===== CONFIG DE PERFORMANCE/ROBUSTEZ =====
 const CYCLES_PER_INSTANCE = 10;        // ✅ 10 ciclos por instância (como você pediu)
@@ -105,8 +100,6 @@ async function runCycle(cycleNumber, instanceCycleNumber) {
     const ip = await getHostPublicIp().catch(() => "desconhecido");
     console.log(`IP do host: ${ip}`);
   }
-
-  console.log("[BOT_PRE] antes_de_abrir_emuladores");
 
   const sitesList = [...sites];
 
@@ -207,7 +200,7 @@ async function runCycle(cycleNumber, instanceCycleNumber) {
       })
     );
   }
-  console.log("[BOT_POST] depois_de_fechar_emuladores");
+  
 
   console.log("Ciclo finalizado.");
 }
