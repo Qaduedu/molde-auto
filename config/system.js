@@ -1,5 +1,5 @@
 export const SYSTEM = {
-  MAX_DEVICES: Number(process.env.MAX_DEVICES || 3),
+  MAX_DEVICES: Number(process.env.MAX_DEVICES || 5),
 
   LOG_HOST_PUBLIC_IP: true,
   HOST_CONNECTIVITY_CHECK: true,

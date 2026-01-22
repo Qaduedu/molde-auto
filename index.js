@@ -14,13 +14,13 @@ import { pause, resume, stop, isStopped, waitIfPaused } from "./utils/control.js
 import { hostConnectivityCheck, getHostPublicIp } from "./services/hostNet.service.js";
 import { waitForBoot, waitForAdbPresence } from "./services/adbWait.service.js";
 
-// ✅ IMPORTA adb “baixo nível” para poder limpar Chrome por instância
 import { adb } from "./services/adb.service.js";
 
 // ===== CONFIG DE PERFORMANCE/ROBUSTEZ =====
-const CYCLES_PER_INSTANCE = 10;        // ✅ 10 ciclos por instância (como você pediu)
-const ADB_PRESENCE_TIMEOUT = 25000;
-const START_STAGGER_MS = 4000;         // evita pico de RAM/commit no Windows
+const CYCLES_PER_INSTANCE = 10;         // 10 ciclos por instância
+const ADB_PRESENCE_TIMEOUT = 120000;    // 2 min (25s é curto demais em PC variado)
+const START_STAGGER_MS = 30000;         // 30s entre boots (para 5 AVDs subir sem “sumir chamada”)
+const RECYCLE_GAP_MS = 8000;            // pausa após reciclar
 // =========================================
 
 function setupKeyboardControls() {
@@ -42,35 +42,32 @@ function setupKeyboardControls() {
   });
 }
 
-// ✅ Limpeza “forte” do Chrome (1x por instância)
-async function clearChromeForInstance(port) {
-  const serial = `emulator-${port}`;
-  console.log(`🧼 [${port}] Limpando Chrome (pm clear) para nova instância...`);
+// ✅ Limpeza forte do Chrome (POR CICLO — como você pediu)
+async function clearChromeForCycle(port) {
+  console.log(`🧼 [${port}] Limpando Chrome (pm clear) para este ciclo...`);
   await adb(port, "shell am force-stop com.android.chrome").catch(() => {});
   await adb(port, "shell pm clear com.android.chrome").catch(() => {});
   await delay(800);
 }
 
-// ✅ Garantia de “device vivo” com recuperação (sem quebrar o resto)
+// ✅ Garantia de “device vivo” com recuperação
 async function ensureDeviceReady(e, { forceRestart = false } = {}) {
-  // Se não for forçar restart, tenta só checar presença
   if (!forceRestart) {
     try {
       const state = await waitForAdbPresence(e.port, { timeoutMs: 6000 });
-      // Se apareceu no adb devices, ótimo; o boot “funcional” é garantido pelo waitForBoot se precisar.
       if (state) return true;
     } catch {}
   }
 
-  // Start/restart do emulador
-  console.log(`🚑 [${e.port}] Iniciando/recuperando emulador...`);
+  console.log(`🚑 [${e.port}] Recuperando emulador...`);
+  try { await killEmulator(e.port); } catch {}
+  await delay(1200);
+
   startEmulator(e);
 
-  // Espera aparecer no ADB
   const state = await waitForAdbPresence(e.port, { timeoutMs: ADB_PRESENCE_TIMEOUT });
   console.log(`🧩 [${e.port}] apareceu no ADB (${state})`);
 
-  // Boot completo/funcional
   await waitForBoot(e.port);
   return true;
 }
@@ -82,7 +79,7 @@ async function runCycle(cycleNumber, instanceCycleNumber) {
   const isRecycleCycle = instanceCycleNumber === CYCLES_PER_INSTANCE;
 
   console.log(`\n🌸 Ciclo ${cycleNumber} começando...`);
-  console.log(`🧱 Instância: ciclo ${instanceCycleNumber}/${CYCLES_PER_INSTANCE} (reuse emulador)`);
+  console.log(`🧱 Instância: ciclo ${instanceCycleNumber}/${CYCLES_PER_INSTANCE}`);
   console.log(`🤖 Devices: ${activeEmulators.length} | 📋 Sites: ${sites.length}`);
   console.log("📌 Dica: pause com 'p', troque Wi-Fi/4G, retome com 'r'.");
 
@@ -98,16 +95,21 @@ async function runCycle(cycleNumber, instanceCycleNumber) {
     }
   } else if (SYSTEM.LOG_HOST_PUBLIC_IP) {
     const ip = await getHostPublicIp().catch(() => "desconhecido");
-    console.log(`IP do host: ${ip}`);
+    console.log(`🌐 IP do host: ${ip}`);
   }
 
   const sitesList = [...sites];
 
-  // 2) Subir emuladores apenas no começo da instância (cascata rápida)
+  // 2) Subir emuladores apenas no começo da instância
   if (isNewInstance) {
     console.log("🚀 Subindo emuladores (headless) [nova instância]...");
+
     for (const e of activeEmulators) {
       await waitIfPaused();
+
+      // ✅ garante porta/instância limpa antes de subir (evita “sobras” do ciclo anterior)
+      try { await killEmulator(e.port); } catch {}
+      await delay(1200);
 
       startEmulator(e);
 
@@ -115,35 +117,31 @@ async function runCycle(cycleNumber, instanceCycleNumber) {
         const state = await waitForAdbPresence(e.port, { timeoutMs: ADB_PRESENCE_TIMEOUT });
         console.log(`🧩 [${e.port}] apareceu no ADB (${state})`);
       } catch (err) {
-        console.log(`💥 [${e.port}] não apareceu no ADB a tempo: ${err?.message || err}`);
+        console.log(`💥 [${e.port}] não apareceu no ADB: ${err?.message || err}`);
         try { await killEmulator(e.port); } catch {}
         continue;
       }
 
+      // ✅ escalonamento para evitar RAM/commit e ADB flapping
       await delay(START_STAGGER_MS);
     }
   } else {
     console.log("⚡ Reutilizando emuladores (sem reboot)...");
   }
 
-  // 3) Boot (só quando necessário)
-  //    - Em nova instância: garante boot de todos
-  //    - Em ciclos seguintes: só recupera quem caiu
+  // 3) Boot / readiness
   console.log("⏳ Garantindo dispositivos prontos...");
   const bootHeartbeat = setInterval(() => console.log("🫧 Preparação ainda em andamento..."), 15000);
 
   const readyEmulators = [];
-
   await Promise.allSettled(
     activeEmulators.map(async (e) => {
       try {
         await waitIfPaused();
 
         if (isNewInstance) {
-          // Boot completo para todos no começo da instância
           await waitForBoot(e.port);
         } else {
-          // Ciclos seguintes: só recupera se sumiu/offline
           await ensureDeviceReady(e, { forceRestart: false });
         }
 
@@ -164,16 +162,13 @@ async function runCycle(cycleNumber, instanceCycleNumber) {
 
   console.log(`✅ Devices prontos: ${readyEmulators.map(d => d.port).join(", ")}`);
 
-  // 4) Limpar Chrome apenas 1x por instância (antes do flow)
-  if (isNewInstance) {
-    console.log("🧼 Limpando Chrome (1x por instância)...");
-    // Faz em paralelo para não atrasar
-    await Promise.allSettled(
-      readyEmulators.map(e => clearChromeForInstance(e.port))
-    );
-  }
+  // 4) Limpar Chrome POR CICLO (como você pediu)
+  console.log("🧼 Limpando Chrome (por ciclo)...");
+  await Promise.allSettled(
+    readyEmulators.map(e => clearChromeForCycle(e.port))
+  );
 
-  // 5) Rodar fluxo em paralelo (sem matar emulador aqui)
+  // 5) Rodar fluxo em paralelo (sem matar emulador a cada ciclo)
   await Promise.all(
     readyEmulators.map(async (e) => {
       console.log(`🧠 [${e.port}] Iniciando fluxo completo`);
@@ -184,23 +179,20 @@ async function runCycle(cycleNumber, instanceCycleNumber) {
       } finally {
         console.log(`🧹 [${e.port}] Flow finalizado`);
         await delay(800);
-        // ⚠️ NÃO matamos o emulador a cada ciclo (ganho de velocidade)
       }
     })
   );
 
-  // 6) Reciclar instância (matar emuladores) apenas no final do período
+  // 6) Reciclar instância (matar emuladores) no final de 10 ciclos
   if (isRecycleCycle) {
     console.log(`♻️ Reciclando instância (fim do período ${CYCLES_PER_INSTANCE})...`);
     await Promise.allSettled(
       readyEmulators.map(async (e) => {
-        try {
-          await killEmulator(e.port);
-        } catch {}
+        try { await killEmulator(e.port); } catch {}
       })
     );
+    await delay(RECYCLE_GAP_MS);
   }
-  
 
   console.log("Ciclo finalizado.");
 }
@@ -228,7 +220,6 @@ async function main() {
   }
 
   console.log("Encerrado com segurança.");
-  
 }
 
 main().catch((e) => {
