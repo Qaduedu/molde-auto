@@ -1,0 +1,12 @@
+node_modules/
+artifacts/
+out/
+.DS_Store
+
+# configs locais por PC
+config/local.env
+.env
+
+# logs
+*.log
+artifacts/emulator-logs/
