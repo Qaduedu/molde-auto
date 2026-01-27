@@ -1,4 +1,3 @@
-node_modules/
+local.env
+.env
 artifacts/
-config/local.env
-.DS_Store

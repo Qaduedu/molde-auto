@@ -11,28 +11,32 @@ import { runDeviceFlow } from "./services/deviceFlow.service.js";
 import { delay } from "./utils/delay.js";
 import { pause, resume, stop, isStopped, waitIfPaused } from "./utils/control.js";
 
-import { hostConnectivityCheck, getHostPublicIp } from "./services/hostNet.service.js";
+import { hostConnectivityCheck } from "./services/hostNet.service.js";
 import { waitForBoot, waitForAdbPresence } from "./services/adbWait.service.js";
-
 import { adb } from "./services/adb.service.js";
 
-// ===== CONFIG DE PERFORMANCE/ROBUSTEZ =====
-const CYCLES_PER_INSTANCE = 10;         // 10 ciclos por instância
-const ADB_PRESENCE_TIMEOUT = 120000;    // 2 min (25s é curto demais em PC variado)
-const START_STAGGER_MS = 30000;         // 30s entre boots (para 5 AVDs subir sem “sumir chamada”)
-const RECYCLE_GAP_MS = 8000;            // pausa após reciclar
-// =========================================
+// ===== CONFIG (via ENV, com defaults iguais ao que você quer) =====
+// quantos ciclos por “instância”
+const CYCLES_PER_INSTANCE = Number(process.env.CYCLES_PER_INSTANCE || 100);
+
+// tempo entre start de emuladores
+const START_STAGGER_MS = Number(process.env.START_STAGGER_MS || 8000);
+
+// pausa depois de reciclar (matar emuladores)
+const RECYCLE_GAP_MS = Number(process.env.RECYCLE_GAP_MS || 6000);
+
+// timeout pra ADB online
+const ADB_TIMEOUT = Number(process.env.ADB_TIMEOUT || 180000);
+
+// delay entre ciclos
+const LOOP_DELAY_MS = Number(process.env.LOOP_DELAY_MS || 3000);
+// ===============================================================
 
 function setupKeyboardControls() {
-  if (!process.stdin.isTTY) {
-    console.log("⚠️  Teclas de controle indisponíveis (stdin não é TTY).");
-    return;
-  }
-
+  if (!process.stdin.isTTY) return;
   readline.emitKeypressEvents(process.stdin);
   process.stdin.setRawMode(true);
 
-  console.log("🎛️  Controles: [p]=pausar  [r]=retomar  [q]=parar após o ciclo");
   process.stdin.on("keypress", (_, key) => {
     if (!key) return;
     if (key.name === "p") pause();
@@ -42,155 +46,94 @@ function setupKeyboardControls() {
   });
 }
 
-// ✅ Limpeza forte do Chrome (POR CICLO — como você pediu)
-async function clearChromeForCycle(port) {
-  console.log(`🧼 [${port}] Limpando Chrome (pm clear) para este ciclo...`);
+// ✅ limpeza total: Chrome + “marcador” do turn-on-sync
+async function heavyCleanForInstance(port) {
+  console.log(`🧼 [${port}] LIMPEZA TOTAL (instância nova)`);
   await adb(port, "shell am force-stop com.android.chrome").catch(() => {});
   await adb(port, "shell pm clear com.android.chrome").catch(() => {});
+  // remove marcador para forçar o bypass rodar de novo nessa instância
+  await adb(port, "shell rm -f /data/local/tmp/chrome_first_run_done").catch(() => {});
   await delay(800);
 }
 
-// ✅ Garantia de “device vivo” com recuperação
-async function ensureDeviceReady(e, { forceRestart = false } = {}) {
-  if (!forceRestart) {
-    try {
-      const state = await waitForAdbPresence(e.port, { timeoutMs: 6000 });
-      if (state) return true;
-    } catch {}
-  }
-
-  console.log(`🚑 [${e.port}] Recuperando emulador...`);
-  try { await killEmulator(e.port); } catch {}
-  await delay(1200);
-
-  startEmulator(e);
-
-  const state = await waitForAdbPresence(e.port, { timeoutMs: ADB_PRESENCE_TIMEOUT });
-  console.log(`🧩 [${e.port}] apareceu no ADB (${state})`);
-
-  await waitForBoot(e.port);
-  return true;
-}
-
 async function runCycle(cycleNumber, instanceCycleNumber) {
-  const activeEmulators = emulators.slice(0, SYSTEM.MAX_DEVICES);
-
+  const active = emulators.slice(0, SYSTEM.MAX_DEVICES);
   const isNewInstance = instanceCycleNumber === 1;
-  const isRecycleCycle = instanceCycleNumber === CYCLES_PER_INSTANCE;
+  const isEndOfInstance = instanceCycleNumber === CYCLES_PER_INSTANCE;
 
   console.log(`\n🌸 Ciclo ${cycleNumber} começando...`);
   console.log(`🧱 Instância: ciclo ${instanceCycleNumber}/${CYCLES_PER_INSTANCE}`);
-  console.log(`🤖 Devices: ${activeEmulators.length} | 📋 Sites: ${sites.length}`);
-  console.log("📌 Dica: pause com 'p', troque Wi-Fi/4G, retome com 'r'.");
+  console.log(`🤖 Devices: ${active.length} | 📋 Sites: ${sites.length}`);
 
-  // 1) Preflight do host: internet + IP público
   if (SYSTEM.HOST_CONNECTIVITY_CHECK) {
     try {
       const ip = await hostConnectivityCheck();
-      console.log(`✅ Host online. IP público atual: ${ip}`);
+      console.log(`✅ Host online. IP público: ${ip}`);
     } catch (e) {
       console.log(`❌ Host sem conectividade: ${e?.message || e}`);
-      console.log("🛑 Vou encerrar este ciclo para você ajustar a rede e tentar novamente.");
       return;
     }
-  } else if (SYSTEM.LOG_HOST_PUBLIC_IP) {
-    const ip = await getHostPublicIp().catch(() => "desconhecido");
-    console.log(`🌐 IP do host: ${ip}`);
   }
 
-  const sitesList = [...sites];
-
-  // 2) Subir emuladores apenas no começo da instância
+  // 1) Sobe emuladores só no começo da instância
   if (isNewInstance) {
-    console.log("🚀 Subindo emuladores (headless) [nova instância]...");
-
-    for (const e of activeEmulators) {
+    console.log("🚀 Subindo emuladores (instância nova)...");
+    for (const e of active) {
       await waitIfPaused();
-
-      // ✅ garante porta/instância limpa antes de subir (evita “sobras” do ciclo anterior)
-      try { await killEmulator(e.port); } catch {}
-      await delay(1200);
-
       startEmulator(e);
-
-      try {
-        const state = await waitForAdbPresence(e.port, { timeoutMs: ADB_PRESENCE_TIMEOUT });
-        console.log(`🧩 [${e.port}] apareceu no ADB (${state})`);
-      } catch (err) {
-        console.log(`💥 [${e.port}] não apareceu no ADB: ${err?.message || err}`);
-        try { await killEmulator(e.port); } catch {}
-        continue;
-      }
-
-      // ✅ escalonamento para evitar RAM/commit e ADB flapping
       await delay(START_STAGGER_MS);
     }
   } else {
-    console.log("⚡ Reutilizando emuladores (sem reboot)...");
+    console.log("⚡ Reutilizando emuladores...");
   }
 
-  // 3) Boot / readiness
-  console.log("⏳ Garantindo dispositivos prontos...");
-  const bootHeartbeat = setInterval(() => console.log("🫧 Preparação ainda em andamento..."), 15000);
+  // 2) ADB + boot
+  console.log("⏳ Garantindo boot...");
+  const ready = [];
 
-  const readyEmulators = [];
   await Promise.allSettled(
-    activeEmulators.map(async (e) => {
+    active.map(async (e) => {
       try {
         await waitIfPaused();
-
-        if (isNewInstance) {
-          await waitForBoot(e.port);
-        } else {
-          await ensureDeviceReady(e, { forceRestart: false });
-        }
-
-        readyEmulators.push(e);
+        await waitForAdbPresence(e.port, { timeoutMs: ADB_TIMEOUT, onlineOnly: true });
+        await waitForBoot(e.port);
+        ready.push(e);
       } catch (err) {
-        console.log(`💥 [${e.port}] falhou ao preparar: ${err?.message || err}`);
-        try { await killEmulator(e.port); } catch {}
+        console.log(`💥 [${e.port}] falhou no boot/adb: ${err?.message || err}`);
       }
     })
   );
 
-  clearInterval(bootHeartbeat);
-
-  if (readyEmulators.length === 0) {
-    console.log("⚠️ Nenhum device ficou pronto neste ciclo. Reiniciando no próximo...");
+  if (ready.length === 0) {
+    console.log("⚠️ Nenhum device pronto. Encerrando ciclo.");
     return;
   }
 
-  console.log(`✅ Devices prontos: ${readyEmulators.map(d => d.port).join(", ")}`);
+  console.log(`✅ Devices prontos: ${ready.map((d) => d.port).join(", ")}`);
 
-  // 4) Limpar Chrome POR CICLO (como você pediu)
-  console.log("🧼 Limpando Chrome (por ciclo)...");
+  // 3) LIMPEZA TOTAL somente no começo da instância (ciclo 1)
+  if (isNewInstance) {
+    await Promise.allSettled(ready.map((e) => heavyCleanForInstance(e.port)));
+  }
+
+  // 4) Flow (passa flag dizendo se é instância nova)
   await Promise.allSettled(
-    readyEmulators.map(e => clearChromeForCycle(e.port))
-  );
-
-  // 5) Rodar fluxo em paralelo (sem matar emulador a cada ciclo)
-  await Promise.all(
-    readyEmulators.map(async (e) => {
-      console.log(`🧠 [${e.port}] Iniciando fluxo completo`);
+    ready.map(async (e) => {
+      console.log(`🧠 [${e.port}] Iniciando fluxo`);
       try {
-        await runDeviceFlow(e.port, sitesList, { cycleNumber });
+        await runDeviceFlow(e.port, sites, { cycleNumber, isNewInstance });
       } catch (err) {
-        console.log(`💥 [${e.port}] Erro no fluxo:`, err?.message || err);
+        console.log(`💥 [${e.port}] Erro no fluxo: ${err?.message || err}`);
       } finally {
         console.log(`🧹 [${e.port}] Flow finalizado`);
-        await delay(800);
       }
     })
   );
 
-  // 6) Reciclar instância (matar emuladores) no final de 10 ciclos
-  if (isRecycleCycle) {
-    console.log(`♻️ Reciclando instância (fim do período ${CYCLES_PER_INSTANCE})...`);
-    await Promise.allSettled(
-      readyEmulators.map(async (e) => {
-        try { await killEmulator(e.port); } catch {}
-      })
-    );
+  // 5) RECICLA no final da instância
+  if (isEndOfInstance) {
+    console.log("♻️ Reciclando instância (fechando emuladores)...");
+    await Promise.allSettled(ready.map((e) => killEmulator(e.port).catch(() => {})));
     await delay(RECYCLE_GAP_MS);
   }
 
@@ -198,7 +141,6 @@ async function runCycle(cycleNumber, instanceCycleNumber) {
 }
 
 async function main() {
-  console.log("🟢 Automação iniciada.");
   setupKeyboardControls();
 
   let cycle = 1;
@@ -212,14 +154,10 @@ async function main() {
     cycle++;
     instanceCycle++;
 
-    if (instanceCycle > CYCLES_PER_INSTANCE) {
-      instanceCycle = 1; // nova instância
-    }
+    if (instanceCycle > CYCLES_PER_INSTANCE) instanceCycle = 1;
 
-    await delay(8000);
+    await delay(LOOP_DELAY_MS);
   }
-
-  console.log("Encerrado com segurança.");
 }
 
 main().catch((e) => {

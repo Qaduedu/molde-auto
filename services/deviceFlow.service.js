@@ -5,9 +5,6 @@ import { waitIfPaused } from "../utils/control.js";
 import { savePageScreenshot } from "./pageConfirm.service.js";
 import { chromeFirstRunStrong } from "./uiGuard.service.js";
 
-
-
-
 function normalizeUrl(url) {
   const u = String(url).trim();
   if (!u) return null;
@@ -16,87 +13,63 @@ function normalizeUrl(url) {
   return fixed;
 }
 
-
-
 async function forceStopChrome(port) {
   await adb(port, "shell am force-stop com.android.chrome").catch(() => {});
 }
 
 async function openChromeMain(port) {
-  await adb(
-    port,
-    "shell am start -n com.android.chrome/com.google.android.apps.chrome.Main"
-  );
+  await adb(port, "shell am start -n com.android.chrome/com.google.android.apps.chrome.Main");
 }
 
 async function ensureChrome(port) {
-  for (let i = 1; i <= 6; i++) {
+  for (let i = 1; i <= 4; i++) {
     try {
       await openChromeMain(port);
-      await delay(1500);
+      await delay(700);
       return;
     } catch {
-      console.log(`🧯 [${port}] Retry ${i}/6 abrindo Chrome...`);
-      await delay(1500 * i);
+      await delay(700 * i);
     }
   }
-
-  // fallback
   await adb(port, "shell monkey -p com.android.chrome 1").catch(() => {});
-  await delay(1500);
+  await delay(700);
 }
 
-async function mustBypassChromeFirstRun(port, reason) {
-  const ok = await chromeFirstRunStrong(port).catch(() => false);
-  if (!ok) {
-    throw new Error(
-      `Chrome preso no first-run (${reason}). Abortando device para evitar loop.`
-    );
-  }
+async function markerExists(port) {
+  const out = await adb(port, "shell ls /data/local/tmp/chrome_first_run_done", { timeoutMs: 8000 }).catch(() => "");
+  return String(out).includes("chrome_first_run_done");
 }
 
-// ✅ SUA FUNÇÃO (EXPORTADA) — pode deixar exatamente assim
+async function setMarker(port) {
+  // sem shell maluco: escreve via sh -c
+  await adb(port, `shell sh -c "echo 1 > /data/local/tmp/chrome_first_run_done"`).catch(() => {});
+}
+
+// sua função existente (mantida e rápida)
 export async function bypassChromeSyncScreen(port) {
-  console.log(`🧩 [${port}] Tentando bypass da tela "Turn on sync?"...`);
+  console.log(`🧩 [${port}] Turn on sync: bypass rápido...`);
 
-  const tapSequences = [
-    ["input tap 180 2080", "input tap 240 2080", "input tap 320 2080"],
-    ["input tap 180 1980", "input tap 240 1980", "input tap 320 1980"],
-    ["input tap 360 2080", "input tap 420 2080", "input tap 480 2080"],
-  ];
-
-  for (const seq of tapSequences) {
-    for (const cmd of seq) {
-      await adb(port, `shell ${cmd}`).catch(() => {});
-      await delay(300);
-    }
-    await delay(400);
-  }
-
-  const keycodes = [66, 61, 22, 21, 66];
-
-  for (const kc of keycodes) {
+  // TAB/ENTER costuma resolver mais rápido que tap infinito
+  const keys = [61, 66, 61, 66]; // TAB, ENTER, TAB, ENTER
+  for (const kc of keys) {
     await adb(port, `shell input keyevent ${kc}`).catch(() => {});
-    await delay(250);
+    await delay(180);
   }
 
-  await adb(
-    port,
-    "shell am broadcast -a com.google.android.apps.chrome.ACTION_FIRST_RUN_COMPLETE"
-  ).catch(() => {});
-
-  await delay(600);
+  await adb(port, "shell am broadcast -a com.google.android.apps.chrome.ACTION_FIRST_RUN_COMPLETE").catch(() => {});
+  await delay(350);
 }
 
-// ✅ IMPORTANTE: este é o export que seu index.js precisa
-export async function runDeviceFlow(port, sitesList, { cycleNumber = 1 } = {}) {
+export async function runDeviceFlow(port, sitesList, { cycleNumber = 1, isNewInstance = false } = {}) {
   console.log(`📱 [${port}] Abrindo navegador`);
 
-
-  // abre chrome e contorna first-run/anr via rotina forte
+  // abre Chrome
   await forceStopChrome(port);
   await ensureChrome(port);
-  await mustBypassChromeFirstRun(port, "inicio");
+
+  // first-run curto
+  const ok = await chromeFirstRunStrong(port, { attempts: 4 }).catch(() => false);
+  if (!ok) throw new Error("Chrome preso no first-run.");
 
   let idx = 0;
   const restartEveryN = Number(SYSTEM.RESTART_CHROME_EVERY_N_PAGES || 3);
@@ -112,14 +85,16 @@ export async function runDeviceFlow(port, sitesList, { cycleNumber = 1 } = {}) {
 
     console.log(`🌍 [${port}] Visitando (${idx}/${sitesList.length}) ${url}`);
 
-    // ✅ Reinicia Chrome a cada N páginas (ok)
+    // restart eventual
     if (SYSTEM.RESTART_CHROME_BETWEEN_PAGES && restartEveryN > 0) {
-      const shouldRestart = idx % restartEveryN === 0;
-      if (shouldRestart) {
+      if (idx % restartEveryN === 0) {
         await forceStopChrome(port);
         await ensureChrome(port);
-        await mustBypassChromeFirstRun(port, `restart a cada ${restartEveryN} páginas`);
-        await delay(600);
+
+        const ok2 = await chromeFirstRunStrong(port, { attempts: 3 }).catch(() => false);
+        if (!ok2) throw new Error("Chrome preso no first-run (restart).");
+
+        await delay(250);
       }
     }
 
@@ -127,38 +102,32 @@ export async function runDeviceFlow(port, sitesList, { cycleNumber = 1 } = {}) {
     await adb(port, `shell am start -a android.intent.action.VIEW -d "${url}"`).catch(() => {});
     await delay(waitMs);
 
-    // ✅ ONLY FIRST SITE: turn on sync / onboarding
-    if (idx === 1) {
-      await chromeFirstRunStrong(port).catch(() => {});
-      await delay(700);
+    // ✅ Turn-on-sync só 1x por instância (no primeiro site)
+    if (idx === 1 && isNewInstance) {
+      const already = await markerExists(port).catch(() => false);
+      if (!already) {
+        await bypassChromeSyncScreen(port).catch(() => {});
+        await setMarker(port).catch(() => {});
 
-      await bypassChromeSyncScreen(port).catch(() => {});
-      await delay(400);
-
-      // reabre a URL após contornar telas
-      await adb(port, `shell am start -a android.intent.action.VIEW -d "${url}"`).catch(() => {});
-      await delay(900);
+        // reabre a URL depois do onboarding
+        await adb(port, `shell am start -a android.intent.action.VIEW -d "${url}"`).catch(() => {});
+        await delay(500);
+      }
     }
 
     await delay(SYSTEM.SCREENSHOT_SETTLE_MS);
 
     if (SYSTEM.TAKE_SCREENSHOT_EACH_PAGE) {
       try {
-        const shot = await savePageScreenshot({
-          port,
-          url,
-          cycleNumber,
-          siteIndex: idx
-        });
-        console.log(`📸 [${port}] Print salvo: ${shot.file} (${Math.round(shot.size / 1024)} KB)`);
+        const shot = await savePageScreenshot({ port, url, cycleNumber, siteIndex: idx });
+        console.log(`📸 [${port}] Print: ${Math.round(shot.size / 1024)} KB`);
       } catch (e) {
-        console.log(`⚠️ [${port}] Falha ao tirar print: ${e?.message || e}`);
+        console.log(`⚠️ [${port}] Print falhou: ${e?.message || e}`);
       }
     }
 
     await delay(SYSTEM.BETWEEN_PAGES_MS);
   }
-
 
   console.log(`❌ [${port}] Fechando navegador`);
   await forceStopChrome(port);

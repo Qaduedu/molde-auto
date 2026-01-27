@@ -1,4 +1,4 @@
-import { spawn, execSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import path from "path";
 import fs from "fs";
 import { SYSTEM } from "../config/system.js";
@@ -8,9 +8,7 @@ function resolveSdk() {
     SYSTEM?.ANDROID_SDK_ROOT ||
     process.env.ANDROID_SDK_ROOT ||
     process.env.ANDROID_HOME ||
-    (process.env.LOCALAPPDATA
-      ? path.join(process.env.LOCALAPPDATA, "Android", "Sdk")
-      : null)
+    (process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Android", "Sdk") : null)
   );
 }
 
@@ -22,13 +20,25 @@ function getEmulatorExe() {
   return exe;
 }
 
-// ✅ cache para não chamar -list-avds toda hora
+// ✅ sem execSync (sem shell)
 let cachedAvds = null;
 function listAvdsCached(emuExe) {
   if (cachedAvds) return cachedAvds;
-  const out = execSync(`"${emuExe}" -list-avds`, { windowsHide: true }).toString();
+
+  const r = spawnSync(emuExe, ["-list-avds"], {
+    windowsHide: true,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8"
+  });
+
+  const out = String(r.stdout || "") + String(r.stderr || "");
   cachedAvds = out.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   return cachedAvds;
+}
+
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
 }
 
 export function startEmulator(e) {
@@ -39,60 +49,51 @@ export function startEmulator(e) {
   if (!avd) throw new Error("AVD não definido em config/emulators.js (use avd).");
   if (!port) throw new Error("Porta não definida em config/emulators.js (use port).");
 
-  // ✅ Falha cedo se o AVD não existir
   const avds = listAvdsCached(EMU);
   if (!avds.includes(avd)) {
     throw new Error(`AVD "${avd}" não existe neste PC. Disponíveis: ${avds.join(", ")}`);
   }
 
-  const args = [
-    "-avd", avd,
-    "-port", String(port),
-    "-no-window",
-    "-no-audio",
-    "-no-boot-anim",
-    "-gpu", "off",
-    "-no-snapshot-save",
-    "-no-snapshot-load"
-  ];
-
-  const debug = process.env.DEBUG_EMULATOR === "1";
-
-  // ✅ log por porta
   const logDir = path.join(process.cwd(), "artifacts", "emulator-logs");
-  fs.mkdirSync(logDir, { recursive: true });
+  ensureDir(logDir);
   const logFile = path.join(logDir, `emulator-${port}.log`);
 
-  // ✅ log limpo no terminal (sem spam)
-  console.log(`🚀 [${port}] start ${avd}${debug ? " (DEBUG)" : ""}`);
+  const args = [
+  "-avd", avd,
+  "-port", String(port),
 
-  if (debug) {
-    // debug: mostra tudo no console
-    const child = spawn(EMU, args, { stdio: "inherit", windowsHide: false });
-    child.on("exit", (code) => console.log(`🛑 [${port}] emulator exit code=${code}`));
-    child.on("error", (err) => console.log(`💥 [${port}] spawn error: ${err?.message || err}`));
-    return;
-  }
+  // 🔥 snapshot obrigatório
+  "-snapshot", "default",
+  "-no-snapshot-save",
 
-  // normal: manda stdout/stderr pro arquivo e mantém terminal limpo
+  // headless real
+  "-no-window",
+  "-no-audio",
+  "-no-boot-anim",
+
+  // GPU estável
+  "-gpu", "swiftshader_indirect",
+
+  "-memory", String(SYSTEM.EMU_MEMORY_MB || 1024),
+  "-cores", String(SYSTEM.EMU_CORES || 1),
+];
+
+
+  console.log(`🚀 [${port}] iniciando ${avd}`);
+  console.log(`📝 [${port}] log: ${logFile}`);
+
   const outFd = fs.openSync(logFile, "a");
 
   const child = spawn(EMU, args, {
     windowsHide: true,
-    stdio: ["ignore", outFd, outFd]
-    // ✅ sem detached (reduz chance de abrir janela/cmd em alguns Windows)
+    shell: false,
+    stdio: ["ignore", outFd, outFd],
+    detached: true
   });
 
   child.on("error", (err) => {
-    console.log(`💥 [${port}] spawn falhou: ${err?.message || err}`);
-    try { fs.closeSync(outFd); } catch {}
+    console.log(`💥 [${port}] spawn emulator falhou: ${err?.message || err}`);
   });
 
-  child.on("exit", (code) => {
-    // não é "erro" necessariamente, mas ajuda a diagnosticar
-    if (code !== 0) {
-      console.log(`⚠️ [${port}] emulador encerrou (code=${code}). Veja: ${logFile}`);
-    }
-    try { fs.closeSync(outFd); } catch {}
-  });
+  child.unref();
 }
